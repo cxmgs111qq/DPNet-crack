@@ -180,7 +180,7 @@ class SideAdapterNetwork(nn.Module):
             torch.zeros(1, num_queries, embed_dims))
         encode_layers = []
         for i in range(cfg_encoder.num_encode_layer): #encode 层数，每一层都是一个transformer，参考san图3，默认8层比图中多
-            encode_layers.append(
+            encode_layers.append( 
                 TransformerEncoderLayer(
                     embed_dims=embed_dims,
                     num_heads=cfg_encoder.num_heads, #默认6头
@@ -545,8 +545,7 @@ class DPHead(BaseDecodeHead):
                 num_queries=san_cfg.num_queries,
                 num_classes=num_classes,
                 assigner=train_cfg.assigner)
-        self.sup_propoty=nn.Parameter(torch.zeros(num_classes,100,1,1)) 
-        self.sup_propoty.requires_grad = False
+        self.sup_propoty=torch.zeros(num_classes,100,1,1).to(device='cuda') #技术测试
         self.count=0 #测试计数
 
     def init_weights(self):
@@ -607,7 +606,7 @@ class DPHead(BaseDecodeHead):
             torch.einsum('bqc,nc->bqn', mask_embed, class_embeds)
             for mask_embed in mask_embeds
         ]
-        return mask_props, mask_logits,support_f
+        return mask_props, mask_logits,support_f #这俩是啥？ predction前的mask proposal和proposal logit
 
 
     def loss(self, x: Tuple[Tensor], batch_data_samples: SampleList,
@@ -629,16 +628,25 @@ class DPHead(BaseDecodeHead):
         support=False #是否分离出支持集
         # batch SegDataSample to InstanceDataSample
         batch_gt_instances = seg_data_to_instance_data(self.ignore_index,
-                                                       batch_data_samples)
+                                                       batch_data_samples)#为什么会存在实例分割的东西？
 
         # forward-
         all_mask_props, all_mask_logits, _= self.forward(#经过forward方法，输出图2 san结尾的mask logit和clip结尾的mask props，但是在本类中均合并到san
             x, self.deep_supervision_idxs,None
             ) #传入support gt
-        # loss
-        losses = self.loss_by_feat(all_mask_logits, all_mask_props,
-                                   batch_gt_instances)
-        self.updatePool(all_mask_props[-1][-1:],batch_data_samples[-1].gt_sem_seg.data.unsqueeze(0))
+        if support:
+            batch_gt_instances=batch_gt_instances[:-1]#去除support
+
+        if isinstance(batch_data_samples[0].img_shape, torch.Size):
+            # slide inference
+            size = batch_data_samples[0].img_shape
+        elif 'pad_shape' in batch_data_samples[0]:
+            size = (batch_data_samples[0].pad_shape)[:2]
+        else:
+            size = batch_data_samples[0].img_shape
+
+        seg_logits=self.DPmodule(all_mask_props[-1], all_mask_logits[-1],size,all_mask_props[-1][-1:],batch_data_samples[-1].gt_sem_seg.data.unsqueeze(0)) #sup_f,sup_gt
+        losses=self.loss_by_feat(seg_logits, batch_data_samples)
         return losses
 
     def predict(self, inputs: Tuple[Tensor], batch_img_metas: List[dict],
@@ -687,162 +695,34 @@ class DPHead(BaseDecodeHead):
             size = batch_img_metas[0]['img_shape']
         #
         # # upsample mask
-        seg_logits=self.DPmodule(mask_pred, cls_score,size) #不需要support_f，因为在训练中sup_propoty已经更新
+        seg_logits=self.DPmodule(mask_pred, cls_score,size) #
 
         return seg_logits
 
-    #EMA版 通过指数移动平均0.9
     def DPmodule(self,mask_pred, cls_score,size,support_f=None,support_gt=None):
 
         # upsample mask
         mask_pred = F.interpolate(
             mask_pred, size=size, mode='bilinear', align_corners=False) #1*100*512*736
 
-        mask_cls = F.softmax(cls_score, dim=-1)[..., :-1]  # 最后一个是背景类，需要去除  b*100*2
-        mask_pred = mask_pred.sigmoid()  # 掩码建议 mask proposal 1*100*512*736
-        clip_pred = torch.einsum('bqc,bqhw->bchw', mask_cls, mask_pred)  # b*cls*h*w，张量收缩，只在q ab相乘后求和
+        mask_cls = F.softmax(cls_score, dim=-1)[..., :-1]  #
+        mask_pred = mask_pred.sigmoid()
+        clip_pred = torch.einsum('bqc,bqhw->bchw', mask_cls, mask_pred)
+        # return clip_pred
         if support_f is not None and support_gt is not None:  # 双原型版
-            self.updatePool(support_f,support_gt)
-
+            temp_sup = masked_average_pooling_km(support_f.detach().clone(), support_gt.detach().clone(),
+                                                 num_classes=self.num_classes)
+            self.sup_propoty =temp_sup
         else:
             self.count+=1
             # print('没选到',self.count)
 
         # 无论是否有support_f，就算没有有可能是分辨率问题
         if mask_pred.shape[0]>1: #训练
-            sup_pred = F.cosine_similarity(self.sup_propoty.data.unsqueeze(0), mask_pred.unsqueeze(1).detach().clone(), dim=2) * 1
+            sup_pred = F.cosine_similarity(self.sup_propoty.unsqueeze(0), mask_pred.unsqueeze(1).detach().clone(), dim=2) * 1
         else: #测试
-            sup_pred = F.cosine_similarity(self.sup_propoty.data, mask_pred, dim=1) * 1
+            sup_pred = F.cosine_similarity(self.sup_propoty, mask_pred, dim=1) * 1
             sup_pred=sup_pred.unsqueeze(0)
         #### 结合两种预测方法
         seg_logits = self.WeightedSum(clip_pred, sup_pred)  # 融合
-        # seg_logits = self.GateSum(clip_pred, sup_pred)  # 融合
-        # self.showDP(clip_pred, sup_pred)
         return seg_logits
-    def updatePool(self,support_f,support_gt):
-        temp_sup = masked_average_pooling_km(support_f.detach().clone(), support_gt.detach().clone(),
-                                             num_classes=self.num_classes)
-        ema_alpha = 0.9
-        with torch.no_grad():
-            self.sup_propoty.data = ema_alpha * self.sup_propoty.data + (1 - ema_alpha) * temp_sup
-             # self.sup_propoty=self.GateSum(self.sup_propoty,temp_sup)
-
-    def loss_by_feat(
-            self, all_cls_scores: Tensor, all_mask_preds: Tensor,
-            batch_gt_instances: List[InstanceData]) -> Dict[str, Tensor]:
-        """Loss function.
-
-        Args:
-            all_cls_scores (Tensor): Classification scores for all decoder
-                layers with shape (num_decoder, batch_size, num_queries,
-                cls_out_channels). Note `cls_out_channels` should includes
-                background.
-            all_mask_preds (Tensor): Mask scores for all decoder layers with
-                shape (num_decoder, batch_size, num_queries, h, w).
-            batch_gt_instances (list[obj:`InstanceData`]): each contains
-                ``labels`` and ``masks``.
-
-        Returns:
-            dict[str, Tensor]: A dictionary of loss components.
-        """
-        num_dec_layers = len(all_cls_scores) #2*[b*100*(cls+1)] num_decoder=2好像是vit里的设置
-        batch_gt_instances_list = [
-            batch_gt_instances for _ in range(num_dec_layers)
-        ]
-
-        losses = []
-        for i in range(num_dec_layers):
-            cls_scores = all_cls_scores[i]
-            mask_preds = all_mask_preds[i]
-            # matching N mask predictions to K category labels
-            (labels, mask_targets, mask_weights,
-             avg_factor) = self.match_masks.get_targets(
-                 cls_scores, mask_preds, batch_gt_instances_list[i])
-            cls_scores = cls_scores.flatten(0, 1) #input b*100*（cls+1）---（b*100）*（cls+1）3
-            labels = labels.flatten(0, 1) #labels b*100--（b*100），100是什么属性（num_queries）
-            num_total_masks = cls_scores.new_tensor([avg_factor],
-                                                    dtype=torch.float)
-            all_reduce(num_total_masks, op='mean')
-            num_total_masks = max(num_total_masks, 1)
-
-            # extract positive ones
-            # shape (batch_size, num_queries, h, w) -> (num_total_gts, h, w)
-            mask_preds = mask_preds[mask_weights > 0]
-
-            if mask_targets.shape[0] != 0:
-                with torch.no_grad():
-                    points_coords = get_uncertain_point_coords_with_randomness(
-                        mask_preds.unsqueeze(1), None,
-                        self.train_cfg.num_points,
-                        self.train_cfg.oversample_ratio,
-                        self.train_cfg.importance_sample_ratio)
-                    # shape (num_total_gts, h, w)
-                    # -> (num_total_gts, num_points)
-                    mask_point_targets = point_sample(
-                        mask_targets.unsqueeze(1).float(),
-                        points_coords).squeeze(1)  #6*12544
-                # shape (num_queries, h, w) -> (num_queries, num_points)
-                mask_point_preds = point_sample(
-                    mask_preds.unsqueeze(1), points_coords).squeeze(1) #6*12544 奇怪的尺寸
-
-            if not isinstance(self.loss_decode, nn.ModuleList):
-                losses_decode = [self.loss_decode]
-            else:
-                losses_decode = self.loss_decode
-            loss = dict()
-            for loss_decode in losses_decode: #1 clsce 2maskce 3dice
-                if 'loss_cls' in loss_decode.loss_name: #分类损失
-                    if loss_decode.loss_name == 'loss_cls_ce':
-                        loss[loss_decode.loss_name] = loss_decode( #(400*20,400)  400是尺寸，20是类数+1，杆孔=2+1 原cnn是512*512*3 和512*512
-                            cls_scores, labels)
-                    else:
-                        assert False, "Only support 'CrossEntropyLoss' in" \
-                                      ' classification loss'
-
-                elif 'loss_mask' in loss_decode.loss_name:#遮罩损失
-                    if mask_targets.shape[0] == 0:
-                        loss[loss_decode.loss_name] = mask_preds.sum()
-                    elif loss_decode.loss_name == 'loss_mask_ce':
-                        loss[loss_decode.loss_name] = loss_decode(
-                            mask_point_preds,
-                            mask_point_targets,
-                            avg_factor=num_total_masks *
-                            self.train_cfg.num_points)
-                    elif loss_decode.loss_name == 'loss_mask_dice':
-                        loss[loss_decode.loss_name] = loss_decode(
-                            mask_point_preds,
-                            mask_point_targets,
-                            avg_factor=num_total_masks)
-                    else:
-                        assert False, "Only support 'CrossEntropyLoss' and" \
-                                      " 'DiceLoss' in mask loss"
-                else:
-                    assert False, "Only support for 'loss_cls' and 'loss_mask'"
-
-            losses.append(loss)
-
-        loss_dict = dict()
-        # loss from the last decoder layer
-        loss_dict.update(losses[-1])
-        # loss from other decoder layers
-        for i, loss in enumerate(losses[:-1]):
-            for k, v in loss.items():
-                loss_dict[f'd{self.deep_supervision_idxs[i]}.{k}'] = v
-        return loss_dict
-
-    def showDP(self,seg_logits,seg_logits2):
-
-        '''!!!可视化'''
-        #预测离散可视化
-        # label1=seg_logits[0].argmax(dim=0) #torch.mean(seg_logits[0], dim=0)
-        # label2=seg_logits2[0].argmax(dim=0) # torch.mean(seg_logits2, dim=0)
-
-        #平均可视化
-        # label1=torch.mean(seg_logits[0], dim=0)
-        # label2=torch.mean(seg_logits2[0], dim=0)
-
-        #最大可视化
-        label1,_=torch.max(seg_logits[0], dim=0)
-        label2,_=torch.max(seg_logits2[0], dim=0)
-        self.show2label(label1,label2) #.argmax(dim=0)
-        ''''''
