@@ -57,7 +57,7 @@ model = dict(
         norm_cfg=dict(type='LN', eps=1e-5)
         ),
     decode_head=dict(
-        type='DPHeadmasklos',
+        type='DPHead',
         num_classes=num_classes,
         deep_supervision_idxs=[7],
         san_cfg=dict(
