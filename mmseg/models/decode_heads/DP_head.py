@@ -20,8 +20,8 @@ from mmseg.models.backbones.vit import TransformerEncoderLayer
 from mmseg.registry import MODELS
 from mmseg.utils import (ConfigType, MatchMasks, SampleList,
                          seg_data_to_instance_data)
-from ..utils import (MLP, LayerNorm2d, PatchEmbed, cross_attn_layer,
-                     get_uncertain_point_coords_with_randomness, resize)
+from mmseg.utils import (MLP, LayerNorm2d, PatchEmbed, cross_attn_layer,
+                         get_uncertain_point_coords_with_randomness, resize)
 from .decode_head import BaseDecodeHead
 from mmseg.models.utils.cxm_few import WeightedSum
 from mmseg.models.utils.cxm_allSegFew import GateSum,masked_average_pooling_km
