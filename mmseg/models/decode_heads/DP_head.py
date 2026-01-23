@@ -18,7 +18,7 @@ from torch.nn import functional as F
 from mmseg.models.backbones.vit import TransformerEncoderLayer
 
 from mmseg.registry import MODELS
-from mmseg.utils import (ConfigType, MatchMasks, SampleList,
+from mmseg.models.utils import (ConfigType, MatchMasks, SampleList,
                          seg_data_to_instance_data)
 from mmseg.utils import (MLP, LayerNorm2d, PatchEmbed, cross_attn_layer,
                          get_uncertain_point_coords_with_randomness, resize)
